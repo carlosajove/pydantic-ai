@@ -20,7 +20,7 @@ interactions:
         - text: Generate an image of an axolotl.
         role: user
       generationConfig: {}
-    uri: https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent
+    uri: https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent
   response:
     headers:
       alt-svc:
@@ -48,7 +48,7 @@ interactions:
           role: model
         finishReason: STOP
         index: 0
-      modelVersion: gemini-2.5-flash-image-preview
+      modelVersion: gemini-2.5-flash-image
       responseId: eMXNaJf4FrDmqtsP2JGRsAQ
       usageMetadata:
         candidatesTokenCount: 1304
@@ -93,7 +93,7 @@ interactions:
         - text: Now give it a sombrero.
         role: user
       generationConfig: {}
-    uri: https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image-preview:generateContent
+    uri: https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent
   response:
     headers:
       alt-svc:
@@ -121,7 +121,7 @@ interactions:
           role: model
         finishReason: STOP
         index: 0
-      modelVersion: gemini-2.5-flash-image-preview
+      modelVersion: gemini-2.5-flash-image
       responseId: gMXNaOfYN4iUmtkPpO_k4AQ
       usageMetadata:
         candidatesTokenCount: 1304
