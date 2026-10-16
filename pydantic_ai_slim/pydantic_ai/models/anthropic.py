@@ -1,7 +1,7 @@
 from __future__ import annotations as _annotations
 
 import io
-from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -66,6 +66,9 @@ _FINISH_REASON_MAP: dict[BetaStopReason, FinishReason] = {
     'pause_turn': 'stop',
     'refusal': 'content_filter',
 }
+
+_MAX_PAUSE_TURN_CONTINUATIONS = 16
+"""Max times we'll retry when the API returns stop_reason='pause_turn' (server-side tool still executing)."""
 
 
 try:
@@ -326,6 +329,44 @@ class AnthropicModel(Model):
             model_request_parameters,
         )
         model_settings = cast(AnthropicModelSettings, model_settings or {})
+
+        current_messages: list[ModelMessage] = list(messages)
+        accumulated_parts: list[ModelResponsePart] = []
+        accumulated_usage = usage.RequestUsage()
+
+        for _attempt in range(_MAX_PAUSE_TURN_CONTINUATIONS):
+            model_response = await self._make_single_request(
+                current_messages, model_settings, model_request_parameters
+            )
+            accumulated_usage.incr(model_response.usage)
+
+            is_pause_turn = (model_response.provider_details or {}).get('finish_reason') == 'pause_turn'
+            if not is_pause_turn:
+                if accumulated_parts:
+                    return replace(
+                        model_response,
+                        parts=[*accumulated_parts, *model_response.parts],
+                        usage=accumulated_usage,
+                    )
+                return model_response
+
+            accumulated_parts.extend(model_response.parts)
+            current_messages.append(model_response)
+
+        raise UnexpectedModelBehavior(  # pragma: no cover
+            f'Anthropic pause_turn loop exceeded {_MAX_PAUSE_TURN_CONTINUATIONS} continuations'
+        )
+
+    async def _make_single_request(
+        self,
+        messages: list[ModelMessage],
+        model_settings: AnthropicModelSettings,
+        model_request_parameters: ModelRequestParameters,
+    ) -> ModelResponse:
+        """Make a single API request, returning a processed ModelResponse.
+
+        Falls back to streaming if the Anthropic SDK requires it for high max_tokens.
+        """
         try:
             response = await self._messages_create(messages, False, model_settings, model_request_parameters)
             return self._process_response(response)
@@ -371,11 +412,21 @@ class AnthropicModel(Model):
             model_settings,
             model_request_parameters,
         )
-        response = await self._messages_create(
-            messages, True, cast(AnthropicModelSettings, model_settings or {}), model_request_parameters
-        )
+        model_settings_cast = cast(AnthropicModelSettings, model_settings or {})
+        original_messages = list(messages)
+
+        async def pause_turn_continuation(accumulated_response: ModelResponse) -> ModelResponse:
+            continuation_messages: list[ModelMessage] = [*original_messages, accumulated_response]
+            response = await self._messages_create(
+                continuation_messages, False, model_settings_cast, model_request_parameters
+            )
+            return self._process_response(response)
+
+        response = await self._messages_create(messages, True, model_settings_cast, model_request_parameters)
         async with response:
-            yield await self._process_streamed_response(response, model_request_parameters)
+            yield await self._process_streamed_response(
+                response, model_request_parameters, pause_turn_continuation
+            )
 
     def prepare_request(
         self, model_settings: ModelSettings | None, model_request_parameters: ModelRequestParameters
@@ -646,8 +697,11 @@ class AnthropicModel(Model):
         )
 
     async def _process_streamed_response(
-        self, response: AsyncStream[BetaRawMessageStreamEvent], model_request_parameters: ModelRequestParameters
-    ) -> StreamedResponse:
+        self,
+        response: AsyncStream[BetaRawMessageStreamEvent],
+        model_request_parameters: ModelRequestParameters,
+        pause_turn_continuation: Callable[[ModelResponse], Awaitable[ModelResponse]] | None = None,
+    ) -> AnthropicStreamedResponse:
         peekable_response = _utils.PeekableAsyncStream(response)
         first_chunk = await peekable_response.peek()
         if isinstance(first_chunk, _utils.Unset):
@@ -661,6 +715,7 @@ class AnthropicModel(Model):
             _response=peekable_response,
             _provider_name=self._provider.name,
             _provider_url=self._provider.base_url,
+            _pause_turn_continuation=pause_turn_continuation,
         )
 
     def _get_tools(
@@ -1344,6 +1399,17 @@ class AnthropicStreamedResponse(StreamedResponse):
     _provider_url: str
     _timestamp: datetime = field(default_factory=_utils.now_utc)
 
+    _pause_turn_continuation: Callable[[ModelResponse], Awaitable[ModelResponse]] | None = field(
+        default=None
+    )
+    _usage_from_previous_continuations: usage.RequestUsage = field(
+        default_factory=usage.RequestUsage, init=False
+    )
+
+    def usage(self) -> usage.RequestUsage:
+        """Get the combined usage across all pause_turn continuations."""
+        return self._usage_from_previous_continuations + self._usage
+
     async def _get_event_iterator(self) -> AsyncIterator[ModelResponseStreamEvent]:  # noqa: C901
         current_block: BetaContentBlock | None = None
 
@@ -1486,6 +1552,34 @@ class AnthropicStreamedResponse(StreamedResponse):
                 current_block = None
             elif isinstance(event, BetaRawMessageStopEvent):  # pragma: no branch
                 current_block = None
+
+        # Handle pause_turn continuation: if the stream ended with pause_turn and a callback is set,
+        # make non-streaming continuation calls until the model finishes normally.
+        for continuation_idx in range(1, _MAX_PAUSE_TURN_CONTINUATIONS):
+            if (self.provider_details or {}).get('finish_reason') != 'pause_turn':
+                break
+            if self._pause_turn_continuation is None:
+                break
+
+            # Save usage from the stream that just ended
+            self._usage_from_previous_continuations.incr(self._usage)
+
+            # Build accumulated response and make continuation call
+            accumulated = self.get()
+            continuation = await self._pause_turn_continuation(accumulated)
+
+            # Update metadata from continuation
+            self._usage = continuation.usage
+            self.finish_reason = continuation.finish_reason
+            self.provider_details = continuation.provider_details
+            self.provider_response_id = continuation.provider_response_id
+
+            # Yield continuation parts (use tuple vendor IDs to avoid collision with stream indices)
+            for part_idx, part in enumerate(continuation.parts):
+                yield self._parts_manager.handle_part(
+                    vendor_part_id=(continuation_idx, part_idx),
+                    part=part,
+                )
 
     @property
     def model_name(self) -> AnthropicModelName:

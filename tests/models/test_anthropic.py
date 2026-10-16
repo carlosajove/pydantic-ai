@@ -8683,3 +8683,365 @@ Fix the errors and try again.\
             },
         ]
     )
+
+
+def _pause_turn_response(content: list[BetaContentBlock], usage: BetaUsage) -> BetaMessage:
+    """Create a BetaMessage with stop_reason='pause_turn'."""
+    return BetaMessage(
+        id='msg_pause',
+        content=content,
+        model='claude-3-5-haiku-123',
+        role='assistant',
+        stop_reason='pause_turn',
+        type='message',
+        usage=usage,
+    )
+
+
+async def test_pause_turn_non_streaming(allow_model_requests: None):
+    """Test that pause_turn responses are handled by retrying internally.
+
+    When the API returns stop_reason='pause_turn' (server-side tool still executing),
+    the model should internally retry by appending the partial response as assistant
+    prefill and re-calling the API, returning a single combined ModelResponse.
+    """
+    # First response: pause_turn with a pending web_search (no result yet)
+    pause_response = _pause_turn_response(
+        [
+            BetaTextBlock(text='Let me search for that.', type='text'),
+            BetaServerToolUseBlock(
+                id='srvtoolu_1',
+                name='web_search',
+                input={'query': 'weather today'},
+                type='server_tool_use',
+                caller=BetaDirectCaller(type='direct'),
+            ),
+        ],
+        BetaUsage(input_tokens=100, output_tokens=20),
+    )
+
+    # Second response: end_turn with the search result and final text
+    final_response = completion_message(
+        [
+            BetaWebSearchToolResultBlock(
+                tool_use_id='srvtoolu_1',
+                type='web_search_tool_result',
+                content=[
+                    BetaWebSearchResultBlock(
+                        title='Weather Today',
+                        url='https://example.com/weather',
+                        type='web_search_result',
+                        encrypted_content='enc_content',
+                    )
+                ],
+            ),
+            BetaTextBlock(text='The weather is sunny today.', type='text'),
+        ],
+        BetaUsage(input_tokens=50, output_tokens=30),
+    )
+
+    mock_client = MockAnthropic.create_mock([pause_response, final_response])
+    m = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(anthropic_client=mock_client))
+    agent = Agent(m, builtin_tools=[WebSearchTool()])
+
+    result = await agent.run('What is the weather today?')
+
+    # The agent should succeed (no 400 error) and produce a single ModelResponse
+    assert result.output == snapshot('The weather is sunny today.')
+
+    # Verify the combined message history
+    messages = result.all_messages()
+    assert len(messages) == 2  # UserPromptPart request + one combined ModelResponse
+
+    model_response = messages[1]
+    assert isinstance(model_response, ModelResponse)
+
+    # All parts from both responses should be combined in order
+    assert [type(p).__name__ for p in model_response.parts] == snapshot(
+        ['TextPart', 'BuiltinToolCallPart', 'BuiltinToolReturnPart', 'TextPart']
+    )
+
+    # Usage should be accumulated from both requests
+    assert model_response.usage.input_tokens == snapshot(150)
+    assert model_response.usage.output_tokens == snapshot(50)
+
+    # finish_reason should be from the final response (end_turn -> 'stop'), not pause_turn
+    assert model_response.finish_reason == 'stop'
+    assert (model_response.provider_details or {}).get('finish_reason') == 'end_turn'
+
+    # The mock should have been called twice (pause_turn + continuation)
+    assert mock_client.index == 2  # pyright: ignore[reportAttributeAccessIssue]
+
+    # The second call should include the partial response as assistant prefill
+    kwargs = mock_client.chat_completion_kwargs  # pyright: ignore[reportAttributeAccessIssue]
+    assert len(kwargs) == 2
+    # Second call's messages should end with an assistant message (the partial response)
+    second_call_messages = kwargs[1]['messages']
+    assert second_call_messages[-1]['role'] == 'assistant'
+
+
+async def test_pause_turn_with_output_type(allow_model_requests: None):
+    """Test that pause_turn works correctly when output_type is set.
+
+    This is the specific scenario from issue #2600: when output_type is set,
+    the agent would inject a retry message after the pause_turn response,
+    causing a malformed request.
+    """
+
+    class WeatherReport(BaseModel):
+        location: str
+        summary: str
+
+    # First response: pause_turn with pending web_search
+    pause_response = _pause_turn_response(
+        [
+            BetaTextBlock(text='Searching for weather...', type='text'),
+            BetaServerToolUseBlock(
+                id='srvtoolu_2',
+                name='web_search',
+                input={'query': 'weather san francisco'},
+                type='server_tool_use',
+                caller=BetaDirectCaller(type='direct'),
+            ),
+        ],
+        BetaUsage(input_tokens=80, output_tokens=15),
+    )
+
+    # Second response: search result + tool call for output
+    final_response = BetaMessage(
+        id='msg_final',
+        content=[
+            BetaWebSearchToolResultBlock(
+                tool_use_id='srvtoolu_2',
+                type='web_search_tool_result',
+                content=[
+                    BetaWebSearchResultBlock(
+                        title='SF Weather',
+                        url='https://example.com/sf-weather',
+                        type='web_search_result',
+                        encrypted_content='enc_sf',
+                    )
+                ],
+            ),
+            BetaToolUseBlock(
+                type='tool_use',
+                id='toolu_output',
+                name='final_result',
+                input={'location': 'San Francisco', 'summary': 'Sunny and warm'},
+            ),
+        ],
+        model='claude-3-5-haiku-123',
+        role='assistant',
+        stop_reason='end_turn',
+        type='message',
+        usage=BetaUsage(input_tokens=60, output_tokens=25),
+    )
+
+    mock_client = MockAnthropic.create_mock([pause_response, final_response])
+    m = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(anthropic_client=mock_client))
+    agent = Agent(m, output_type=WeatherReport, builtin_tools=[WebSearchTool()])
+
+    result = await agent.run('What is the weather in San Francisco?')
+
+    # The agent should succeed without the 400 error from issue #2600
+    assert isinstance(result.output, WeatherReport)
+    assert result.output.location == 'San Francisco'
+    assert result.output.summary == 'Sunny and warm'
+
+
+async def test_pause_turn_multiple_continuations(allow_model_requests: None):
+    """Test that multiple consecutive pause_turn responses are handled."""
+    # First response: pause_turn
+    first_pause = _pause_turn_response(
+        [
+            BetaTextBlock(text='Searching...', type='text'),
+            BetaServerToolUseBlock(
+                id='srvtoolu_a',
+                name='web_search',
+                input={'query': 'first query'},
+                type='server_tool_use',
+                caller=BetaDirectCaller(type='direct'),
+            ),
+        ],
+        BetaUsage(input_tokens=50, output_tokens=10),
+    )
+
+    # Second response: also pause_turn (another search)
+    second_pause = _pause_turn_response(
+        [
+            BetaWebSearchToolResultBlock(
+                tool_use_id='srvtoolu_a',
+                type='web_search_tool_result',
+                content=[
+                    BetaWebSearchResultBlock(
+                        title='First Result',
+                        url='https://example.com/1',
+                        type='web_search_result',
+                        encrypted_content='enc1',
+                    )
+                ],
+            ),
+            BetaTextBlock(text='Let me search more.', type='text'),
+            BetaServerToolUseBlock(
+                id='srvtoolu_b',
+                name='web_search',
+                input={'query': 'second query'},
+                type='server_tool_use',
+                caller=BetaDirectCaller(type='direct'),
+            ),
+        ],
+        BetaUsage(input_tokens=40, output_tokens=15),
+    )
+
+    # Third response: final answer
+    final_response = completion_message(
+        [
+            BetaWebSearchToolResultBlock(
+                tool_use_id='srvtoolu_b',
+                type='web_search_tool_result',
+                content=[
+                    BetaWebSearchResultBlock(
+                        title='Second Result',
+                        url='https://example.com/2',
+                        type='web_search_result',
+                        encrypted_content='enc2',
+                    )
+                ],
+            ),
+            BetaTextBlock(text='Based on my research, here is the answer.', type='text'),
+        ],
+        BetaUsage(input_tokens=30, output_tokens=20),
+    )
+
+    mock_client = MockAnthropic.create_mock([first_pause, second_pause, final_response])
+    m = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(anthropic_client=mock_client))
+    agent = Agent(m, builtin_tools=[WebSearchTool()])
+
+    result = await agent.run('Do a deep research')
+
+    assert result.output == snapshot('Based on my research, here is the answer.')
+
+    messages = result.all_messages()
+    model_response = messages[1]
+    assert isinstance(model_response, ModelResponse)
+
+    # All parts from all three responses should be combined
+    assert [type(p).__name__ for p in model_response.parts] == snapshot(
+        [
+            'TextPart',
+            'BuiltinToolCallPart',
+            'BuiltinToolReturnPart',
+            'TextPart',
+            'BuiltinToolCallPart',
+            'BuiltinToolReturnPart',
+            'TextPart',
+        ]
+    )
+
+    # Usage should be accumulated from all three requests
+    assert model_response.usage.input_tokens == snapshot(120)
+    assert model_response.usage.output_tokens == snapshot(45)
+
+    # Three API calls were made
+    assert mock_client.index == 3  # pyright: ignore[reportAttributeAccessIssue]
+
+
+async def test_pause_turn_streaming(allow_model_requests: None):
+    """Test that pause_turn is handled correctly during streaming.
+
+    The initial streaming response ends with pause_turn, then the continuation
+    callback makes a non-streaming call and yields the continuation parts.
+    """
+    # Streaming events for the initial response with pause_turn
+    pause_turn_stream: list[BetaRawMessageStreamEvent] = [
+        BetaRawMessageStartEvent(
+            type='message_start',
+            message=BetaMessage(
+                id='msg_stream_pause',
+                model='claude-3-5-haiku-123',
+                role='assistant',
+                type='message',
+                content=[],
+                stop_reason=None,
+                usage=BetaUsage(input_tokens=80, output_tokens=0),
+            ),
+        ),
+        BetaRawContentBlockStartEvent(
+            type='content_block_start',
+            index=0,
+            content_block=BetaTextBlock(text='Searching...', type='text'),
+        ),
+        BetaRawContentBlockStopEvent(type='content_block_stop', index=0),
+        BetaRawContentBlockStartEvent(
+            type='content_block_start',
+            index=1,
+            content_block=BetaServerToolUseBlock(
+                id='srvtoolu_stream',
+                name='web_search',
+                input={'query': 'streaming test'},
+                type='server_tool_use',
+                caller=BetaDirectCaller(type='direct'),
+            ),
+        ),
+        BetaRawContentBlockStopEvent(type='content_block_stop', index=1),
+        BetaRawMessageDeltaEvent(
+            type='message_delta',
+            delta=Delta(stop_reason='pause_turn'),
+            usage=BetaMessageDeltaUsage(input_tokens=80, output_tokens=10),
+        ),
+        BetaRawMessageStopEvent(type='message_stop'),
+    ]
+
+    # Non-streaming continuation response
+    continuation_response = completion_message(
+        [
+            BetaWebSearchToolResultBlock(
+                tool_use_id='srvtoolu_stream',
+                type='web_search_tool_result',
+                content=[
+                    BetaWebSearchResultBlock(
+                        title='Streaming Result',
+                        url='https://example.com/stream',
+                        type='web_search_result',
+                        encrypted_content='enc_stream',
+                    )
+                ],
+            ),
+            BetaTextBlock(text='Here is the streamed answer.', type='text'),
+        ],
+        BetaUsage(input_tokens=40, output_tokens=20),
+    )
+
+    # Placeholder at index 0 (unused — streaming call uses stream, not messages_)
+    placeholder = completion_message([], BetaUsage(input_tokens=0, output_tokens=0))
+
+    mock_client = cast(
+        AsyncAnthropic,
+        MockAnthropic(
+            stream=[pause_turn_stream],
+            messages_=[placeholder, continuation_response],
+        ),
+    )
+    m = AnthropicModel('claude-sonnet-4-5', provider=AnthropicProvider(anthropic_client=mock_client))
+    agent = Agent(m, builtin_tools=[WebSearchTool()])
+
+    async with agent.run_stream('Test streaming pause_turn') as result:
+        # Consume the stream (this triggers pause_turn continuation internally)
+        async for _event in result.stream_output(debounce_by=None):
+            pass
+
+    response = result.all_messages()[-1]
+    assert isinstance(response, ModelResponse)
+
+    # Parts should include both streamed and continuation content
+    part_types = [type(p).__name__ for p in response.parts]
+    assert 'TextPart' in part_types
+    assert 'BuiltinToolCallPart' in part_types
+    assert 'BuiltinToolReturnPart' in part_types
+
+    # Usage should be combined from stream + continuation
+    assert response.usage.input_tokens == snapshot(120)
+    assert response.usage.output_tokens == snapshot(30)
+
+
+# endregion
